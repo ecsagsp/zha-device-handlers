@@ -1,7 +1,14 @@
 """TS011F plug."""
 
+from __future__ import annotations
+
+from typing import Any, Final
+
 from zha.quirks import TUYA_PLUG_ONOFF
 from zigpy.profiles import zgp, zha
+import zigpy.types as t
+from zigpy.typing import UNDEFINED, AddressingMode, UndefinedType
+from zigpy.zcl import foundation
 from zigpy.zcl.clusters.general import (
     Basic,
     GreenPowerProxy,
@@ -16,7 +23,14 @@ from zigpy.zcl.clusters.homeautomation import ElectricalMeasurement
 from zigpy.zcl.clusters.lightlink import LightLink
 from zigpy.zcl.clusters.measurement import TemperatureMeasurement
 from zigpy.zcl.clusters.smartenergy import Metering
+from zigpy.zcl.foundation import BaseCommandDefs, ZCLAttributeDef, ZCLCommandDef
 
+from zhaquirks.builder import (
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfPower,
+    UnitOfTemperature,
+)
 from zhaquirks.const import (
     DEVICE_TYPE,
     ENDPOINTS,
@@ -1920,5 +1934,312 @@ class Plug_v7(EnchantedDevice):
     )
     .exposes_feature(TUYA_PLUG_ONOFF)
     .tuya_enchantment()
+    .add_to_registry()
+)
+
+
+# Breaker protection settings, sent and reported on the 0xE001 cluster as Tuya
+# commands 0xE6 (temperature, power) and 0xE7 (current, voltage). The payload is a
+# list of 4-byte records: [protection key, trip (0/1), value high byte, value low].
+# With trip set the relay turns off at the limit, otherwise the device only alarms.
+TUYA_CMD_TEMPERATURE_POWER: Final = 0xE6
+TUYA_CMD_CURRENT_VOLTAGE: Final = 0xE7
+
+# protection -> (command, record key, threshold attribute, trip attribute)
+BREAKER_PROTECTIONS: Final = {
+    "over_current": (TUYA_CMD_CURRENT_VOLTAGE, 0x01, 0xE781, 0xE701),
+    "over_voltage": (TUYA_CMD_CURRENT_VOLTAGE, 0x03, 0xE783, 0xE703),
+    "under_voltage": (TUYA_CMD_CURRENT_VOLTAGE, 0x04, 0xE784, 0xE704),
+    "temperature": (TUYA_CMD_TEMPERATURE_POWER, 0x05, 0xE685, 0xE605),
+    "power": (TUYA_CMD_TEMPERATURE_POWER, 0x07, 0xE687, 0xE607),
+}
+
+
+class TuyaBreakerProtectionCluster(TuyaZBExternalSwitchTypeCluster):
+    """Tuya 0xE001 cluster with circuit breaker protection settings.
+
+    The protection attributes are not ZCL attributes on the device: writes are sent
+    as Tuya commands, and the device reports the settings back with the same
+    commands. Reads are served from the cache.
+    """
+
+    class AttributeDefs(TuyaZBExternalSwitchTypeCluster.AttributeDefs):
+        """Attribute definitions."""
+
+        over_current_threshold: Final = ZCLAttributeDef(
+            id=0xE781, type=t.uint16_t, is_manufacturer_specific=True
+        )
+        over_current_breaker: Final = ZCLAttributeDef(
+            id=0xE701, type=t.Bool, is_manufacturer_specific=True
+        )
+        over_voltage_threshold: Final = ZCLAttributeDef(
+            id=0xE783, type=t.uint16_t, is_manufacturer_specific=True
+        )
+        over_voltage_breaker: Final = ZCLAttributeDef(
+            id=0xE703, type=t.Bool, is_manufacturer_specific=True
+        )
+        under_voltage_threshold: Final = ZCLAttributeDef(
+            id=0xE784, type=t.uint16_t, is_manufacturer_specific=True
+        )
+        under_voltage_breaker: Final = ZCLAttributeDef(
+            id=0xE704, type=t.Bool, is_manufacturer_specific=True
+        )
+        temperature_threshold: Final = ZCLAttributeDef(
+            id=0xE685, type=t.uint16_t, is_manufacturer_specific=True
+        )
+        temperature_breaker: Final = ZCLAttributeDef(
+            id=0xE605, type=t.Bool, is_manufacturer_specific=True
+        )
+        power_threshold: Final = ZCLAttributeDef(
+            id=0xE687, type=t.uint16_t, is_manufacturer_specific=True
+        )
+        power_breaker: Final = ZCLAttributeDef(
+            id=0xE607, type=t.Bool, is_manufacturer_specific=True
+        )
+
+    class ServerCommandDefs(BaseCommandDefs):
+        """Server command definitions."""
+
+        set_temperature_power_protection: Final = ZCLCommandDef(
+            id=TUYA_CMD_TEMPERATURE_POWER,
+            schema={"data": t.SerializableBytes},
+            manufacturer_code=None,
+        )
+        set_current_voltage_protection: Final = ZCLCommandDef(
+            id=TUYA_CMD_CURRENT_VOLTAGE,
+            schema={"data": t.SerializableBytes},
+            manufacturer_code=None,
+        )
+
+    class ClientCommandDefs(BaseCommandDefs):
+        """Client command definitions."""
+
+        temperature_power_protection_report: Final = ZCLCommandDef(
+            id=TUYA_CMD_TEMPERATURE_POWER,
+            schema={"data": t.SerializableBytes},
+            manufacturer_code=None,
+        )
+        current_voltage_protection_report: Final = ZCLCommandDef(
+            id=TUYA_CMD_CURRENT_VOLTAGE,
+            schema={"data": t.SerializableBytes},
+            manufacturer_code=None,
+        )
+
+    _PROTECTION_ATTRS: Final = frozenset(
+        attr_id
+        for _, _, threshold_id, trip_id in BREAKER_PROTECTIONS.values()
+        for attr_id in (threshold_id, trip_id)
+    )
+
+    def handle_cluster_request(
+        self,
+        hdr: foundation.ZCLHeader,
+        args: list[Any],
+        *,
+        dst_addressing: AddressingMode | None = None,
+    ) -> None:
+        """Update the protection settings from the device reports."""
+        if hdr.command_id not in (
+            TUYA_CMD_TEMPERATURE_POWER,
+            TUYA_CMD_CURRENT_VOLTAGE,
+        ):
+            super().handle_cluster_request(hdr, args, dst_addressing=dst_addressing)
+            return
+
+        data = bytes(args.data)
+        for i in range(0, len(data) - 3, 4):
+            key, trip, value_high, value_low = data[i : i + 4]
+            for (
+                command,
+                record_key,
+                threshold_id,
+                trip_id,
+            ) in BREAKER_PROTECTIONS.values():
+                if (command, record_key) == (hdr.command_id, key):
+                    self._update_attribute(threshold_id, (value_high << 8) | value_low)
+                    self._update_attribute(trip_id, bool(trip))
+                    break
+
+    async def read_attributes(
+        self,
+        attributes: list[int | str | foundation.ZCLAttributeDef],
+        allow_cache: bool = False,
+        only_cache: bool = False,
+        manufacturer: int | UndefinedType | None = UNDEFINED,
+        **kwargs,
+    ) -> Any:
+        """Serve the protection settings from the cache."""
+        protection, remote = [], []
+        for attribute in attributes:
+            attr_id = self.find_attribute(attribute).id
+            (protection if attr_id in self._PROTECTION_ATTRS else remote).append(
+                attribute
+            )
+
+        success: dict[Any, Any] = {}
+        failure: dict[Any, Any] = {}
+        if remote:
+            success, failure = await super().read_attributes(
+                remote,
+                allow_cache=allow_cache,
+                only_cache=only_cache,
+                manufacturer=manufacturer,
+                **kwargs,
+            )
+        for attribute in protection:
+            value = self._attr_cache.get(self.find_attribute(attribute).id)
+            if value is None:
+                failure[attribute] = foundation.Status.UNSUPPORTED_ATTRIBUTE
+            else:
+                success[attribute] = value
+        return success, failure
+
+    async def write_attributes(
+        self,
+        attributes: dict[str | int | foundation.ZCLAttributeDef, Any],
+        manufacturer: int | UndefinedType | None = UNDEFINED,
+        **kwargs,
+    ) -> list[list[foundation.WriteAttributesStatusRecord]]:
+        """Send the protection settings as Tuya commands."""
+        remote = {}
+        for attribute, value in attributes.items():
+            attr_id = self.find_attribute(attribute).id
+            if attr_id in self._PROTECTION_ATTRS:
+                await self._write_protection(attr_id, value)
+            else:
+                remote[attribute] = value
+
+        if remote:
+            return await super().write_attributes(
+                remote, manufacturer=manufacturer, **kwargs
+            )
+        return [[foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS)]]
+
+    async def _write_protection(self, attr_id: int, value: Any) -> None:
+        """Send one protection record: its threshold and trip setting together."""
+        name, (command, key, threshold_id, trip_id) = next(
+            (name, protection)
+            for name, protection in BREAKER_PROTECTIONS.items()
+            if attr_id in protection[2:]
+        )
+
+        if attr_id == threshold_id:
+            threshold = int(value)
+            trip = self._attr_cache.get(trip_id)
+            # A new limit with no known trip setting is meant to protect: trip.
+            trip = True if trip is None else bool(trip)
+        else:
+            trip = bool(value)
+            threshold = self._attr_cache.get(threshold_id)
+            if threshold is None:
+                raise ValueError(
+                    f"The {name} threshold is unknown: set it before its trip setting"
+                )
+            threshold = int(threshold)
+
+        await self.command(
+            command,
+            data=t.SerializableBytes(
+                bytes([key, int(trip), (threshold >> 8) & 0xFF, threshold & 0xFF])
+            ),
+            expect_reply=False,
+        )
+        self._update_attribute(threshold_id, threshold)
+        self._update_attribute(trip_id, trip)
+
+
+# Earu circuit breaker. Same signature and readings as Plug_CB_Metering, plus the
+# protection settings. Unlike the Tongou above, its temperature sensor works, so
+# TemperatureMeasurement is kept with its entity.
+(
+    TuyaQuirkBuilder("_TZ3000_zrm3oxsh", "TS011F")
+    .filter(signature_matches(Plug_CB_Metering.signature))
+    .replaces(TuyaZBOnOffAttributeCluster)
+    .replaces(TuyaZBMeteringCluster)
+    .replaces(TuyaZBElectricalMeasurement)
+    .replaces(TuyaZBE000Cluster)
+    .replaces(TuyaBreakerProtectionCluster)
+    .exposes_feature(TUYA_PLUG_ONOFF)
+    .tuya_enchantment()
+    .number(
+        attribute_name=TuyaBreakerProtectionCluster.AttributeDefs.over_current_threshold.name,
+        cluster_id=TuyaBreakerProtectionCluster.cluster_id,
+        min_value=1,
+        max_value=63,
+        step=1,
+        unit=UnitOfElectricCurrent.AMPERE,
+        translation_key="over_current_threshold",
+        fallback_name="Over-current threshold",
+    )
+    .switch(
+        attribute_name=TuyaBreakerProtectionCluster.AttributeDefs.over_current_breaker.name,
+        cluster_id=TuyaBreakerProtectionCluster.cluster_id,
+        translation_key="over_current_breaker",
+        fallback_name="Over-current trip",
+    )
+    .number(
+        attribute_name=TuyaBreakerProtectionCluster.AttributeDefs.over_voltage_threshold.name,
+        cluster_id=TuyaBreakerProtectionCluster.cluster_id,
+        min_value=230,
+        max_value=265,
+        step=1,
+        unit=UnitOfElectricPotential.VOLT,
+        translation_key="over_voltage_threshold",
+        fallback_name="Over-voltage threshold",
+    )
+    .switch(
+        attribute_name=TuyaBreakerProtectionCluster.AttributeDefs.over_voltage_breaker.name,
+        cluster_id=TuyaBreakerProtectionCluster.cluster_id,
+        translation_key="over_voltage_breaker",
+        fallback_name="Over-voltage trip",
+    )
+    .number(
+        attribute_name=TuyaBreakerProtectionCluster.AttributeDefs.under_voltage_threshold.name,
+        cluster_id=TuyaBreakerProtectionCluster.cluster_id,
+        min_value=75,
+        max_value=240,
+        step=1,
+        unit=UnitOfElectricPotential.VOLT,
+        translation_key="under_voltage_threshold",
+        fallback_name="Under-voltage threshold",
+    )
+    .switch(
+        attribute_name=TuyaBreakerProtectionCluster.AttributeDefs.under_voltage_breaker.name,
+        cluster_id=TuyaBreakerProtectionCluster.cluster_id,
+        translation_key="under_voltage_breaker",
+        fallback_name="Under-voltage trip",
+    )
+    .number(
+        attribute_name=TuyaBreakerProtectionCluster.AttributeDefs.power_threshold.name,
+        cluster_id=TuyaBreakerProtectionCluster.cluster_id,
+        min_value=1,
+        max_value=26,
+        step=1,
+        unit=UnitOfPower.KILO_WATT,
+        translation_key="power_threshold",
+        fallback_name="Over-power threshold",
+    )
+    .switch(
+        attribute_name=TuyaBreakerProtectionCluster.AttributeDefs.power_breaker.name,
+        cluster_id=TuyaBreakerProtectionCluster.cluster_id,
+        translation_key="power_breaker",
+        fallback_name="Over-power trip",
+    )
+    .number(
+        attribute_name=TuyaBreakerProtectionCluster.AttributeDefs.temperature_threshold.name,
+        cluster_id=TuyaBreakerProtectionCluster.cluster_id,
+        min_value=40,
+        max_value=100,
+        step=1,
+        unit=UnitOfTemperature.CELSIUS,
+        translation_key="temperature_threshold",
+        fallback_name="High-temperature threshold",
+    )
+    .switch(
+        attribute_name=TuyaBreakerProtectionCluster.AttributeDefs.temperature_breaker.name,
+        cluster_id=TuyaBreakerProtectionCluster.cluster_id,
+        translation_key="temperature_breaker",
+        fallback_name="High-temperature trip",
+    )
     .add_to_registry()
 )
