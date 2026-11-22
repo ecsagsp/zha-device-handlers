@@ -2149,3 +2149,131 @@ async def test_ts000f_attribute_report(
     attr_id = onoff_cluster.attributes_by_name[attribute].id
     assert listener.attribute_updates == [(attr_id, expected_value)]
     assert isinstance(listener.attribute_updates[0][1], type(expected_value))
+
+
+def _earu_breaker(zigpy_device_from_quirk):
+    """Build the Earu TS011F breaker (_TZ3000_zrm3oxsh) with its quirk applied."""
+    return DEVICE_REGISTRY.resolve(
+        _tongou_device(zigpy_device_from_quirk, "_TZ3000_zrm3oxsh")
+    )
+
+
+def test_ts011f_zrm3oxsh_quirk_selection(zigpy_device_from_quirk):
+    """Test the Earu breaker keeps the readings fixes and gets the protections."""
+    device = _earu_breaker(zigpy_device_from_quirk)
+
+    assert not isinstance(device, zhaquirks.tuya.ts011f_plug.Plug_CB_Metering)
+    ep = device.endpoints[1]
+    assert isinstance(ep.on_off, TuyaZBOnOffAttributeCluster)
+    assert isinstance(ep.smartenergy_metering, TuyaZBMeteringCluster)
+    assert isinstance(ep.electrical_measurement, TuyaZBElectricalMeasurement)
+    assert isinstance(
+        ep.in_clusters[TuyaZBExternalSwitchTypeCluster.cluster_id],
+        zhaquirks.tuya.ts011f_plug.TuyaBreakerProtectionCluster,
+    )
+
+    # This breaker has a working temperature sensor: its entity stays
+    assert TemperatureMeasurement.cluster_id in ep.in_clusters
+    entry = DEVICE_REGISTRY.match_entry(device)
+    assert (
+        EntityFilter(endpoint_id=1, cluster_id=TemperatureMeasurement.cluster_id)
+        not in entry.zha_device_factory.quirk_definition.disabled_default_entities
+    )
+
+
+@pytest.mark.parametrize(
+    ("writes", "expected_command", "expected_record"),
+    [
+        # A new limit with an unknown trip setting turns the trip on
+        ({"over_current_threshold": 16}, 0xE7, b"\x01\x01\x00\x10"),
+        # Voltages above 255 use both value bytes
+        ({"over_voltage_threshold": 260}, 0xE7, b"\x03\x01\x01\x04"),
+        ({"under_voltage_threshold": 180}, 0xE7, b"\x04\x01\x00\xb4"),
+        ({"power_threshold": 10}, 0xE6, b"\x07\x01\x00\x0a"),
+        ({"temperature_threshold": 80}, 0xE6, b"\x05\x01\x00\x50"),
+        # Changing the trip setting resends the known limit
+        (
+            {"over_current_threshold": 16, "over_current_breaker": False},
+            0xE7,
+            b"\x01\x00\x00\x10",
+        ),
+    ],
+)
+async def test_ts011f_zrm3oxsh_write_protection(
+    zigpy_device_from_quirk, writes, expected_command, expected_record
+):
+    """Test protection settings are sent as Tuya commands."""
+    device = _earu_breaker(zigpy_device_from_quirk)
+    cluster = device.endpoints[1].in_clusters[
+        TuyaZBExternalSwitchTypeCluster.cluster_id
+    ]
+
+    with mock.patch.object(
+        cluster.endpoint, "request", new_callable=mock.AsyncMock
+    ) as request_mock:
+        for attribute, value in writes.items():
+            (status,) = await cluster.write_attributes({attribute: value})
+            assert status[0].status == foundation.Status.SUCCESS
+
+    data = bytes(request_mock.mock_calls[-1].kwargs["data"])
+    assert request_mock.mock_calls[-1].kwargs["cluster"] == cluster.cluster_id
+    assert data[2] == expected_command
+    assert data[3:] == expected_record
+
+    for attribute, value in writes.items():
+        assert cluster.get(attribute) == value
+
+
+async def test_ts011f_zrm3oxsh_trip_needs_threshold(zigpy_device_from_quirk):
+    """Test a trip setting is not sent while its limit is unknown."""
+    device = _earu_breaker(zigpy_device_from_quirk)
+    cluster = device.endpoints[1].in_clusters[
+        TuyaZBExternalSwitchTypeCluster.cluster_id
+    ]
+
+    with (
+        mock.patch.object(
+            cluster.endpoint, "request", new_callable=mock.AsyncMock
+        ) as request_mock,
+        pytest.raises(ValueError),
+    ):
+        await cluster.write_attributes({"over_current_breaker": True})
+
+    request_mock.assert_not_called()
+
+
+def test_ts011f_zrm3oxsh_protection_report(zigpy_device_from_quirk):
+    """Test the protection reports from the device update the attributes."""
+    device = _earu_breaker(zigpy_device_from_quirk)
+    cluster = device.endpoints[1].in_clusters[
+        TuyaZBExternalSwitchTypeCluster.cluster_id
+    ]
+
+    # Server to client, cluster specific, command 0xE7 with three records
+    cluster.handle_message(
+        *cluster.deserialize(
+            b"\x09\x05\xe7"
+            + b"\x01\x01\x00\x20"  # over-current 32 A, trip
+            + b"\x03\x00\x01\x09"  # over-voltage 265 V, alarm only
+            + b"\x04\x01\x00\xaa"  # under-voltage 170 V, trip
+        )
+    )
+    # Command 0xE6: temperature and power
+    cluster.handle_message(
+        *cluster.deserialize(
+            b"\x09\x06\xe6"
+            + b"\x05\x00\x00\x50"  # temperature 80 C, alarm only
+            + b"\x07\x01\x00\x0d"  # power 13 kW, trip
+        )
+    )
+
+    assert cluster.get("over_current_threshold") == 32
+    assert cluster.get("over_current_breaker") is True
+    assert cluster.get("over_voltage_threshold") == 265
+    assert cluster.get("over_voltage_breaker") is False
+    assert cluster.get("under_voltage_threshold") == 170
+    assert cluster.get("under_voltage_breaker") is True
+    assert cluster.get("temperature_threshold") == 80
+    assert cluster.get("temperature_breaker") is False
+    assert cluster.get("power_threshold") == 13
+    assert cluster.get("power_breaker") is True
